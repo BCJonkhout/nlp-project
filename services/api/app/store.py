@@ -24,10 +24,27 @@ class EvalStore:
                     chosen_option TEXT,
                     chosen_method TEXT,
                     top_k INTEGER,
-                    window_size INTEGER
+                    window_size INTEGER,
+                    topic TEXT,
+                    scenario TEXT,
+                    has_scenario INTEGER
                 )
                 """
             )
+            self._ensure_columns(con)
+
+    @staticmethod
+    def _ensure_columns(con: sqlite3.Connection):
+        cur = con.execute("PRAGMA table_info(evaluations)")
+        existing = {row[1] for row in cur.fetchall()}
+        desired = {
+            "topic": ("ALTER TABLE evaluations ADD COLUMN topic TEXT",),
+            "scenario": ("ALTER TABLE evaluations ADD COLUMN scenario TEXT",),
+            "has_scenario": ("ALTER TABLE evaluations ADD COLUMN has_scenario INTEGER",),
+        }
+        for column, ddl in desired.items():
+            if column not in existing:
+                con.execute(ddl[0])
 
     def create(self, record: Dict[str, Any]):
         with self._conn() as con:
@@ -35,8 +52,8 @@ class EvalStore:
                 """
                 INSERT INTO evaluations (
                     evaluation_id, created_at, question, optionA_json, optionB_json,
-                    chosen_option, chosen_method, top_k, window_size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    chosen_option, chosen_method, top_k, window_size, topic, scenario, has_scenario
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["evaluation_id"],
@@ -48,13 +65,16 @@ class EvalStore:
                     record.get("chosen_method"),
                     record.get("top_k"),
                     record.get("window_size"),
+                    record.get("topic"),
+                    record.get("scenario"),
+                    1 if record.get("has_scenario") else 0,
                 ),
             )
 
     def get(self, evaluation_id: str) -> Optional[Dict[str, Any]]:
         with self._conn() as con:
             cur = con.execute(
-                "SELECT evaluation_id, created_at, question, optionA_json, optionB_json, chosen_option, chosen_method, top_k, window_size FROM evaluations WHERE evaluation_id = ?",
+                "SELECT evaluation_id, created_at, question, optionA_json, optionB_json, chosen_option, chosen_method, top_k, window_size, topic, scenario, has_scenario FROM evaluations WHERE evaluation_id = ?",
                 (evaluation_id,),
             )
             row = cur.fetchone()
@@ -70,6 +90,9 @@ class EvalStore:
                 "chosen_method": row[6],
                 "top_k": row[7],
                 "window_size": row[8],
+                "topic": row[9],
+                "scenario": row[10],
+                "has_scenario": bool(row[11]) if row[11] is not None else None,
             }
 
     def update_choice(self, evaluation_id: str, chosen_option: str, chosen_method: str):
@@ -88,4 +111,3 @@ def json_dumps(obj: Any) -> str:
 def json_loads(s: str) -> Any:
     import json
     return json.loads(s) if s else None
-

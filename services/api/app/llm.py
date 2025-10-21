@@ -149,6 +149,29 @@ def expand_query(question: str) -> Dict[str, List[str]]:
     try:
         resp = model.generate_content([sys, user], generation_config={"temperature": 0.1})
         text = (getattr(resp, "text", None) or "").strip()
+        if not text:
+            # Try to assemble text from candidate parts (Vertex SDK sometimes omits .text)
+            fragments: List[str] = []
+            for cand in getattr(resp, "candidates", []) or []:
+                content = getattr(cand, "content", None)
+                parts = getattr(content, "parts", None) if content else None
+                if not parts and hasattr(cand, "content"):
+                    parts = getattr(cand.content, "parts", None)
+                if not parts:
+                    continue
+                for part in parts:
+                    fragment = getattr(part, "text", None)
+                    if fragment:
+                        fragments.append(fragment)
+            text = "".join(fragments).strip()
+        if text.startswith("```"):
+            # Handle fenced JSON (```json ... ```)
+            segments = text.split("```")
+            if len(segments) >= 3:
+                text = segments[1]
+                if text.lower().startswith("json"):
+                    text = text[4:]
+                text = (text or "").strip()
         import json as _json
         data = _json.loads(text)
         bm25_terms = [str(x) for x in data.get("bm25_terms", [])][:8]

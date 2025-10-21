@@ -6,9 +6,13 @@ class StartEvalRequest(BaseModel):
     question: str
     top_k: int | None = 5
     window_size: int | None = 0
+    topic: str | None = None
+    scenario: str | None = None
+    scenario_defined: bool | None = None
 
 
 class OptionPayload(BaseModel):
+    method: str | None = None
     answer: str
     sources: List[Dict[str, Any]]
 

@@ -69,15 +69,33 @@ def health():
 
 @app.post("/evaluate/start", response_model=StartEvalResponse)
 def start_evaluation(req: StartEvalRequest):
-    question = req.question.strip()
-    if not question:
+    raw_question = req.question.strip()
+    if not raw_question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     top_k = req.top_k or 5
     window_size = req.window_size or 0
+    topic = (req.topic or "").strip() or None
+    scenario_text = (req.scenario or "").strip()
+    has_scenario = (
+        bool(req.scenario_defined)
+        if req.scenario_defined is not None
+        else bool(scenario_text)
+    )
+    question = raw_question
+    if scenario_text and scenario_text not in question:
+        question = f"{raw_question}\n\nScenario: {scenario_text}"
 
     t0 = time.monotonic()
-    log.info("eval.start q_len=%d top_k=%d window=%d", len(question), top_k, window_size)
+    log.info(
+        "eval.start q_len=%d raw_q_len=%d top_k=%d window=%d topic=%s has_scenario=%s",
+        len(question),
+        len(raw_question),
+        top_k,
+        window_size,
+        topic or "-",
+        has_scenario,
+    )
 
     # Expand NL question into BM25 terms/phrases and vector concepts
     expansion = expand_query(question)
@@ -162,6 +180,9 @@ def start_evaluation(req: StartEvalRequest):
         "chosen_method": None,
         "top_k": top_k,
         "window_size": window_size,
+        "topic": topic,
+        "scenario": scenario_text,
+        "has_scenario": has_scenario,
     }
     store.create(record)
     log.info(
@@ -171,8 +192,16 @@ def start_evaluation(req: StartEvalRequest):
 
     return StartEvalResponse(
         evaluation_id=eval_id,
-        optionA={"answer": options[0]["answer"], "sources": options[0]["sources"]},
-        optionB={"answer": options[1]["answer"], "sources": options[1]["sources"]},
+        optionA={
+            "method": options[0]["method"],
+            "answer": options[0]["answer"],
+            "sources": options[0]["sources"],
+        },
+        optionB={
+            "method": options[1]["method"],
+            "answer": options[1]["answer"],
+            "sources": options[1]["sources"],
+        },
     )
 
 
