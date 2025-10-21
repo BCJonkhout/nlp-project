@@ -1,118 +1,309 @@
-Dutch Law RAG Evaluation
-========================
+# Dutch Law RAG Evaluation
 
-Goal
-----
-- Evaluate which retrieval context works best for answering questions about Dutch law: BM25 (keyword) vs text embeddings.
-- Keep the generator G constant (same LLM and prompt across both conditions).
-- Provide a simple A/B evaluation UI where users see two shuffled answers and pick the better one.
+Dutch Law RAG Evaluation is a self-contained playground for comparing sparse (BM25) and dense (Gemini-powered) retrieval on the Dutch Civil Code while keeping the downstream language model constant. The stack ships with ingestion tooling, a lightweight evaluation UI, and an offline judging workflow so you can rapidly test RAG design choices with grounded evidence.
 
-Repository Contents (relevant)
-------------------------------
-- `scraper/deep_crawler_wetten.py`: Crawl wetten.overheid.nl (HTML and PDF) and dump content.
-- `scraper/convert_wetten_crawled_to_markdown.py`: Convert crawl dumps into structured Markdown.
-- `rag-pipeline/rag-pipeline.py`: Partial code that references Weaviate ingestion/querying; not a complete service.
-- `docker-compose.yml`: Orchestrates the evaluation stack.
-- `services/api`: FastAPI app serving the A/B evaluation UI and APIs.
-- `scripts/ingest.py`: Ingest Markdown into OpenSearch (BM25) and Weaviate (embeddings).
+## Quick Links
+- [Motivation](#motivation)
+- [Project Goals](#project-goals)
+- [Technical Architecture](#technical-architecture)
+- [Data & Content Pipeline](#data--content-pipeline)
+- [Environment Configuration](#environment-configuration)
+- [Local Setup](#local-setup)
+- [Evaluation Workflow](#evaluation-workflow)
+- [Results](#results)
+- [Troubleshooting](#troubleshooting)
+- [Appendices](#appendix-a-directory-reference)
 
-Architecture
-------------
-- `OpenSearch` stores chunks for BM25 retrieval.
-- `Weaviate` stores chunks with vectors using `text2vec-google` (Gemini embeddings) for near-text retrieval.
-- `API (FastAPI)` exposes endpoints to:
-  - start an evaluation: run both retrievers, use same LLM to generate answers, return shuffled options A/B
-  - submit a choice: persist which option (and thus which method) was preferred
-- `SQLite` persists evaluations in a lightweight file (`/data/evaluations.sqlite`).
+## Motivation
+Legal Amsterdam asked, *"How do classical keyword systems compare against modern embedding retrieval for Dutch law?"* We wanted a practical answer, not another whitepaper. This repository was built to generate that answer end-to-end: scrape primary sources, ingest them twice, produce A/B completions with a fixed generator, and collect human or LLM preferences.
+Several requirements shaped the solution:
+1. **Tight feedback loops.** Legal experts should be able to run new experiments locally without touching infra.
+2. **Trustworthy comparisons.** No silent prompt drift, no hidden temperature changes—only retrieval should differ.
+3. **Tunable transparency.** Every retrieved chunk and answer needs to be inspectable, logged, and reproducible.
+4. **Extendable foundation.** Today it is the Dutch Civil Code, tomorrow it might be jurisprudence or policy manuals.
 
-Query Expansion (Natural Language → Retrieval)
----------------------------------------------
-- The API expands natural-language questions before retrieval:
-  - BM25: Gemini (or a local fallback) extracts key terms and short phrases. The BM25 query uses a bool with boosted `match_phrase` and `match` clauses, ensuring at least one term matches.
-  - Embeddings: The same expansion yields multiple `nearText` concepts for Weaviate to improve recall/precision.
-- This allows asking natural questions while BM25 still benefits from precise term/phrase matching.
-- Environment vars (optional):
-  - `GEMINI_MODEL` influences both answering and expansion; by default a Gemini Flash model is used.
+## Project Goals
+- Deliver a runnable stack that contrasts BM25 and vector retrieval against the same Gemini model with identical prompts.
+- Provide a minimal yet expressive UI that allows evaluators to choose between two blindly shuffled answers.
+- Offer scripts for acquiring and standardising raw legislation directly from overheid.nl (HTML and PDF).
+- Enable offline or automated judging so large batches can be scored without each question being reviewed manually.
+- Capture telemetry (evaluation decisions, top_k, scenario flags) in SQLite for downstream analytics.
+- Document the entire path—from raw crawl to evaluation results—to give practitioners confidence in the numbers.
 
-Prerequisites
--------------
-- Docker and Docker Compose.
-- Google Cloud service account JSON for Vertex AI access (Gemini).
-  - Place the JSON at `secrets/gcp.json` (project root). It is mounted into containers at `/secrets/gcp.json`.
-  - Set `GCP_PROJECT` and `GCP_LOCATION` in your `.env`.
+## Technical Architecture
+At a glance, the system is a Docker Compose stack with four major pieces: a FastAPI service, OpenSearch, Weaviate, and a shared SQLite database. Scripts outside the stack handle ingestion and offline evaluation.
 
-Quick Start
------------
-1) Copy `.env.example` to `.env` and edit if needed.
+```text
+┌─────────┐   question        ┌─────────────────────────────┐
+│ Browser │ ───────────────▶  │ FastAPI service (services/) │
+└─────────┘   choice ▲        │  • Query expansion          │
+                     │        │  • BM25 + embedding search  │
+                     │        │  • Gemini answer generation │
+                     │        │  • SQLite persistence       │
+                     │        └──────────────┬──────────────┘
+                     │                       │
+                     │                       │─────────contexts──────| 
+                     │                       │                       |
+           answers ◀─┴───┐          ┌────────▼────────┐    ┌────────▼─────────┐
+                         │          │ OpenSearch       │    │ Weaviate         │
+                         │          │ (BM25 retriever) │    │ (vector store)   │
+                         │          └──────────────────┘    └──────────────────┘
+                         │                 ▲                         ▲
+                         │                 │                         │
+                         └──────────────┬──┴──────────────┬──────────┘
+                                        │                 │
+                                        │  ingestion      │
+                                        ▼                 ▼
+                             ┌─────────────────┐  ┌──────────────────┐
+                             │ Markdown corpus │  │ Weaviate classes │
+                             └─────────────────┘  └──────────────────┘
+```
 
-2) Start the stack:
-   docker compose up -d --build
+### Component Summary
+- **FastAPI app (`services/api`)**  
+  Serves the evaluation UI, orchestrates retrieval, calls Gemini twice with identical prompts, shuffles answers, and records votes.
+- **OpenSearch (`opensearch`)**  
+  Stores chunked legislation for BM25 queries, leveraging boosted `match_phrase` and `match` clauses generated by the expansion step.
+- **Weaviate (`weaviate`)**  
+  Provides vector search using the `text2vec-google` module. Concept lists from Gemini, or a local fallback, are passed to `nearText`.
+- **SQLite (`/data/evaluations.sqlite`)**  
+  Persists evaluation metadata (`evaluation_id`, payloads, votes, top_k, scenario presence) for analytics and reproducibility. Found in the docker files from the API container.
+- **Ingestion tooling (`scripts/ingest.py`)**  
+  Splits Markdown into overlapping chunks, inserts deterministic IDs into OpenSearch, and creates/stuffs a Weaviate class with optional rate limiting.
+- **Scraper utilities (`scraper/`)**  
+  `deep_crawler_wetten.py` fetches HTML/PDF from wetten.overheid.nl with retries and concurrent workers; `convert_wetten_crawled_to_markdown.py` normalises the crawl output into Markdown suitable for ingestion.
+- **Evaluation assets (`evaluation/`)**  
+  Contains prompt lists (`evaluation_questions.json`), automated judging outputs (`judge_results.json`), and exploration notebooks.
 
-   Services:
-   - API/UI: http://localhost:8000
-   - Weaviate: http://localhost:8080
-   - OpenSearch: http://localhost:9200
+### Retrieval Control Flow
+1. A question arrives from the UI along with optional `top_k`, `window_size`, topic, and scenario metadata.
+2. `expand_query` tries Vertex AI to emit BM25 terms, phrases, and vector concepts. When credentials are missing, a deterministic keyword fallback activates.
+3. The BM25 retriever builds a bool query that boosts phrases (slop 1) and key terms while keeping the original question in the mix.
+4. The vector retriever sends a GraphQL `nearText` request (with a gRPC fallback) and optionally expands the window by fetching neighbouring chunks.
+5. Both retrieval contexts are fed to `generate_answer`, which enforces a Dutch-language, citation-heavy prompt using Gemini. If Gemini is unavailable, a visible fallback message is returned.
+6. The two answers (now labelled A/B) are shuffled and stored together with the supporting sources.
+7. When the evaluator submits a choice, the mapping from option to retrieval method is resolved and the result is written back to SQLite.
 
-3) Ingest data (Markdown from the provided scraper/converter):
-   python scripts/ingest.py path/to/wetten.md --os-host localhost --w-host localhost --w-grpc-port 50051
+### Logging and Observability
+- Configurable log level via `LOG_LEVEL` and `LOG_FORMAT` environment variables.
+- Structured log lines include `eval.start`, `bm25.search`, `weaviate.graphql`, and `gen.start/gen.done` markers to trace latency and failure reasons.
+- Critical errors such as Vertex authentication failures, OpenSearch exceptions, or Weaviate rate limits are caught and replaced with graceful fallbacks visible both in logs and UI.
 
-   Notes:
-   - This splits Markdown into ~1000-char chunks (200 overlap) and indexes into both OpenSearch and Weaviate.
-   - Default OpenSearch index is `laws_bm25`, Weaviate class `DocumentChunk`.
-   - Weaviate collection is created with `text2vec-google` vectorizer (server-side Gemini embeddings).
-   - For OpenSearch 3.x images, an initial admin password may be required by the Security plugin. The compose file disables the plugin for local use and sets `DISABLE_INSTALL_DEMO_CONFIG=true`. If you choose to enable security, set `OPENSEARCH_INITIAL_ADMIN_PASSWORD` and configure `OPENSEARCH_USER`/`OPENSEARCH_PASSWORD` in `.env`.
+## Data & Content Pipeline
+- **Acquisition:** `scraper/deep_crawler_wetten.py` walks overheid.nl with bounded depth, respects the host domain, retries on 429/5xx, and extracts HTML or PDF text. Concurrency is controlled through a bounded worker pool and throttle delay.
+- **Transformation:** `scraper/convert_wetten_crawled_to_markdown.py` converts the crawl JSON into Markdown with authored headings, preserving article references for citation in answers.
+- **Chunking:** `scripts/ingest.py` slices Markdown into ~1000 character windows with 200 character overlap. Chunks inherit a deterministic ID derived from the document ID and chunk index for idempotent re-ingestion.
+- **Storage:**  
+  - OpenSearch index mappings expose `content`, `document_id`, `chunk_index`, and `source`.  
+  - Weaviate creates a `DocumentChunk` class with identical properties, optionally binding the vectorizer to a specific Google project via `text2vec-google`.
+- **Rate Limiting:** The ingestion script supports `--w-rate-limit-per-minute` to avoid 429 responses from managed Weaviate instances.
+- **Provenance:** Sources stored in both indices include the original filename (e.g., `BWBR0005289.md`) so citations can be traced back to specific legislative artefacts.
 
-4) Run an evaluation:
-   - Open http://localhost:8000
-   - Enter a question about Dutch law and click "Generate Options".
-   - Review Options A and B (answers + sources) and pick the better one.
-   - The app stores your choice and reveals which method you picked.
+## Environment Configuration
+All runtime services derive configuration from a `.env` file. Start by copying the reference template:
 
-Keeping G Constant (Generator)
------------------------------
-- The API uses Google Gemini (Vertex AI) for both retrieval conditions with the same prompt/config.
-- Provide a Google Cloud service account JSON and set:
-  - `GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp.json` (mounted file)
-  - `GCP_PROJECT` and `GCP_LOCATION` (e.g., `europe-west4`)
-  - Optional: `GEMINI_MODEL` (default `gemini-2.5-flash`)
-- If Gemini is not configured, the API returns a deterministic fallback string so you can still test the flow.
+```bash
+cp .env.example .env
+```
 
-Endpoints
----------
-- `POST /evaluate/start` { question, top_k?, window_size? }
-  - Returns: `evaluation_id`, and two options (A/B) with answers and sources.
+The template bundled with this project contains:
 
-- `POST /evaluate/submit` { evaluation_id, choice: 'A'|'B'|'N' }
-  - Returns: confirmation with the chosen method (`bm25`, `embeddings`, or `neutral`).
+```dotenv
+# API
+EVAL_DB_PATH=/data/evaluations.sqlite
 
-Data Model (SQLite)
--------------------
-- Table `evaluations`: stores `evaluation_id`, timestamps, question, A/B payloads (JSON), and user choice.
+# OpenSearch (BM25)
+OPENSEARCH_HOST=opensearch
+OPENSEARCH_PORT=9200
+BM25_INDEX=laws_bm25
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=ChangeMeStrong123!
+OPENSEARCH_USER=admin
+OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
 
-Configuration
--------------
-- `.env.example` includes:
-  - `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT`, `GCP_LOCATION`, `GEMINI_MODEL`, `GEMINI_EMBEDDING_MODEL`
-  - `OPENSEARCH_HOST/PORT`, `BM25_INDEX`
-  - `OPENSEARCH_INITIAL_ADMIN_PASSWORD` (for 3.x security), optional `OPENSEARCH_USER`/`OPENSEARCH_PASSWORD`
-  - `WEAVIATE_HOST/PORT`, `WEAVIATE_CLASS`
-  - `EVAL_DB_PATH`
+# Weaviate (Embeddings)
+WEAVIATE_HOST=weaviate
+WEAVIATE_PORT=8080
+WEAVIATE_CLASS=DocumentChunk
 
-Relation to rag-pipeline
-------------------------
+# Gemini (Vertex AI)
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp.json
+GCP_PROJECT=YOUR_GCP_PROJECT_ID
+GCP_LOCATION=europe-west4
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+```
 
-- A self-contained ingestion and evaluation stack is provided via `scripts/ingest.py` and `services/api`, using a `DocumentChunk`-like schema (`content`, `document_id`, `chunk_index`, `source`).
+Key notes:
+- Mount your Google Cloud service account JSON into `./secrets/gcp.json`. Docker Compose maps that into each container at `/secrets/gcp.json`.
+- When testing without Vertex AI credentials, leave the Gemini variables unset; the API will still respond with deterministic fallback strings so UI testing remains possible.
+- If you enable OpenSearch security (e.g., moving to the 3.x image), set `OPENSEARCH_INITIAL_ADMIN_PASSWORD` and reuse the same credentials in `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
+- `WEAVIATE_GRPC_PORT` defaults to `50051`, but you can override it in the environment or via the ingestion script CLI.
 
-Troubleshooting
----------------
-- Weaviate with `text2vec-google` needs a valid GCP project and service account; ensure the secret is mounted and `GCP_PROJECT` is set.
-- If OpenSearch is red/initializing, wait ~30s before ingestion/search.
-- If you see placeholder answers, confirm GCP credentials are configured or check logs for Gemini errors.
- - If BM25 results feel too broad, reduce `top_k` or adjust your query; the expansion layer is additive, but you can refine the question to steer terms/phrases.
- - If ingesting from host, ensure Weaviate gRPC port 50051 is exposed (compose maps `50051:50051`) and pass `--w-grpc-port 50051` to the ingest script.
+## Local Setup
+1. Install **Docker** and **Docker Compose**. Any recent Docker Desktop (>= 4.30) works.
+2. Copy `.env.example` to `.env` and adjust the variables described above.
+3. Place your Vertex AI service account JSON under `secrets/gcp.json` if you plan to use Gemini for query expansion and answer generation.
+4. Launch the stack:
+   ```bash
+   docker compose up --build
+   ```
+   The FastAPI service will expose:
+   - UI / API: `http://localhost:8000`
+   - OpenSearch REST: `http://localhost:9200`
+   - Weaviate HTTP: `http://localhost:8080`
+5. Ingest Markdown corpus chunks (see the next section) before running evaluations; the API does not attempt to populate indices automatically.
+6. Tail logs as needed:
+   ```bash
+   docker compose logs -f api
+   ```
 
-Next Steps / Ideas
-------------------
-- Add batch evaluation mode with CSV/JSON of questions and a simple results dashboard.
-- Add richer logging: response latency, token usage, and retrieval scores.
-- Extend ingestion to support ZIPs and PDFs directly (using the existing scraper outputs).
+## Ingestion Workflow
+Use the helper script to index Markdown documents into both stores:
+
+```bash
+python3 scripts/ingest.py data/civil_code/BWBR0005289.md \
+  --os-host localhost \
+  --os-port 9200 \
+  --os-index laws_bm25 \
+  --w-host localhost \
+  --w-port 8080 \
+  --w-class DocumentChunk \
+  --w-grpc-port 50051
+```
+
+Important behaviours:
+- Re-running the script on the same document updates existing chunks thanks to deterministic OpenSearch IDs and UUID5 strings for Weaviate.
+- Pass `--recreate-class` to drop and rebuild the Weaviate class (useful after schema changes). Beware: this deletes existing vectors.
+- Supply `--gcp-project` when the Weaviate instance requires an explicit project bound to `text2vec-google`.
+- `--w-rate-limit-per-minute` defaults to `50000`. Lower it when targeting hosted Weaviate services with stricter quotas.
+
+## Running Evaluations
+1. Browse to `http://localhost:8000`.
+2. Enter a question about Dutch law. Add optional scenario context or adjust `top_k` and `window_size`.
+3. Click **Generate Options**. Two answers appear with sources hidden to avoid bias.
+4. Pick *Option A*, *Option B*, or *Geen voorkeur (N)*. The UI will show which retrieval strategy won after submission.
+
+### API Endpoints
+- `POST /evaluate/start`  
+  Request body includes `question`, optional `top_k`, `window_size`, `topic`, `scenario`, and `scenario_defined`.  
+  The response returns `evaluation_id`, and two option payloads `{ method, answer, sources[] }`.
+- `POST /evaluate/submit`  
+  Accepts an `evaluation_id` from the previous step and a `choice` of `"A"`, `"B"`, or `"N"`. Returns `chosen_method` to confirm whether BM25, embeddings, or neutral was selected.
+- `GET /health`  
+  Minimal readiness check used by Compose probes.
+
+### Query Expansion Details
+- Gemini prompts ask for up to eight BM25 terms, multi-token phrases, and vector concepts. Responses are parsed from JSON; code handles fenced outputs (```json ... ```) gracefully.
+- When Gemini access fails, `_simple_keyword_expand` tokenises the question, removes Dutch stop words, and emits up to ten unique keywords reused for both BM25 and vector queries.
+
+## Evaluation Workflow
+The repository contains resources for structured evaluations:
+- `evaluation/evaluation_questions.json` holds 200 prompts that alternate between plain and scenario-enriched questions across Books 1–10 of the Dutch Civil Code.
+- `evaluation/llm_judge.ipynb` demonstrates automated judging using Gemini as a surrogate evaluator. It loads evaluation runs, prompts the judge, and exports `judge_results.json`.
+- `evaluation/judge_results.json` captures the outcome of 200 judged comparisons, including topics, scenario flags, and the retrieval method each judge preferred.
+
+### Running a Batch Evaluation
+1. Generate A/B answers programmatically (e.g., via the API or a separate script) and record them per question.
+2. Use the notebook to feed each pair into a judging model. The shared prompt reveals the ground truth mapping only after the judge picks an option.
+3. Persist aggregated statistics back into JSON for inclusion in reports or dashboards.
+4. Optional: run `python3` snippets to summarise preferences per topic, scenario type, or other metadata. See the Results section for examples.
+
+## Results
+The 200-question automated judging run (Gemini judge, Oktober 2025) produced the following headline numbers:
+
+| Retrieval Method Chosen | Count | Share |
+| --- | ---: | ---: |
+| BM25 | 143 | 71.5% |
+| Embeddings | 35 | 17.5% |
+| Neutral | 22 | 11.0% |
+
+Scenario sensitivity:
+
+| Scenario Type | BM25 | Embeddings | Neutral | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Plain question | 77 | 16 | 7 | BM25 remained ahead but embeddings secured 17% wins. |
+| Scenario provided | 66 | 19 | 15 | Scenario-rich prompts increased neutral judgements and helped embeddings narrow the gap. |
+
+Topic-level highlights (each topic has 20 judgements):
+
+| Civil Code Book | BM25 Wins | Embedding Wins | Neutral | Observation |
+| --- | ---: | ---: | ---: | --- |
+| Boek 2: Rechtspersonen | 11 | 8 | 1 | Most balanced topic; dense retrieval thrives on corporate terminology. |
+| Boek 8: Verkeersmiddelen en vervoer | 13 | 6 | 1 | Embeddings performed comparatively well when transport-specific jargon appeared. |
+| Boek 7A: Benoemde contracten (oud BW) | 11 | 2 | 7 | High neutral rate hints at ambiguous legacy phrasing needing better grounding. |
+
+Key takeaways:
+- BM25 currently dominates on statutory text where exact article numbers and formulaic phrasing matter.
+- Embeddings gain ground in scenario-heavy prompts, suggesting better semantic recall when questions depart from literal titles.
+- Neutral outcomes cluster around legacy contract law (Book 7A) and private international law edge cases, signalling opportunities for improved context retrieval or judge prompts.
+
+## Interpreting the Numbers Responsibly
+- **Judge bias:** Automated judges can inherit the retriever bias they were trained on. Always spot-check critical cases with domain experts.
+- **Data coverage:** The current corpus focuses on the Dutch Civil Code. Statutes, regulations, or jurisprudence not yet ingested will predictably lead to neutral or low-quality answers.
+- **Prompt hygiene:** Small prompt tweaks to the generator or judge can swing percentages. Keep prompt templates versioned and noted alongside results.
+- **Index freshness:** Laws change. Re-run the scraper and ingestion pipeline regularly to ensure the stack reflects the latest consolidated texts.
+
+## Development Guidelines
+- Python modules rely on FastAPI, Pydantic, `opensearch-py`, `weaviate-client`, and the Vertex AI SDK.
+- Logging is intentionally verbose. Use `LOG_LEVEL=DEBUG` while debugging retrieval or `LOG_LEVEL=INFO` in normal operation.
+- Add experiments under `scripts/` or `evaluation/` rather than modifying the core service; Docker images install dependencies from `services/api/requirements.txt`.
+- If you extend the schema (e.g., add chunk metadata), update both the ingestion script and FastAPI response models.
+
+## Troubleshooting
+- **Weaviate authentication errors:** Confirm that the container sees `/secrets/gcp.json` and that `GCP_PROJECT` matches the project that owns your Gemini quota.
+- **OpenSearch index missing:** Run `scripts/ingest.py` at least once; the script auto-creates mappings with a single shard and zero replicas.
+- **Fallback answers appear:** Indicates Gemini credentials are missing or misconfigured. The fallback message includes a context preview to aid debugging.
+- **429 from Weaviate:** Lower `--w-rate-limit-per-minute` or add exponential backoff around ingestion. The script already throttles submissions, but hosted clusters might enforce stricter limits.
+- **Chunk context empty:** Inspect ingestion logs for parsing issues. HTML pages without `<article>` tags can scrape poorly—adjust the converter if needed.
+- **UI shows stale answers:** Clear browser cache when redeploying; the static files are served directly from the container without fingerprinting.
+
+## Observability Tips
+- Attach `docker compose logs -f weaviate` to monitor module loading and Google authentication on startup.
+- Run `docker compose exec opensearch bash -lc "curl -s localhost:9200/_cat/indices?v"` to inspect index health and document counts.
+- `sqlite3 data/evaluations.sqlite "SELECT chosen_method, COUNT(*) FROM evaluations GROUP BY chosen_method;"` provides a quick sanity check on recorded votes.
+
+## Roadmap Ideas
+1. Batch evaluation endpoint that accepts a JSONL of questions and streams aggregated tallies.
+2. Enriched UI that reveals sources after judging, enabling qualitative analysis without breaking the blind.
+3. Integration with a judge ensemble (human + LLM) to measure inter-rater agreement.
+4. Retrieval heuristics such as BM25 + semantic reranking, or hybrid scoring with reciprocal rank fusion.
+5. Monitoring hooks for token usage and latency to quantify the operational cost of each retrieval strategy.
+
+## Security & Compliance
+- The repository assumes on-prem evaluation without personal data. When deploying in production, harden OpenSearch security and restrict the evaluation UI behind authentication.
+- Store service account keys securely; the example mounts secrets read-only into containers.
+- Consider redacting scenario text if it contains sensitive case details before persisting evaluations.
+
+## Appendix A: Directory Reference
+- `data/` – Example Markdown inputs and derivative datasets.
+- `docker-compose.yml` – Orchestrates API, OpenSearch, and Weaviate with persistent volumes.
+- `evaluation/` – Question sets, judgement exports, and notebooks.
+- `scraper/` – Crawling and conversion utilities for wetten.overheid.nl.
+- `scripts/` – Command-line tools (currently ingestion).
+- `services/api/` – FastAPI application, static UI, retriever wrappers, and storage helpers.
+- `secrets/` – Mount point for credentials (excluded from version control).
+
+## Appendix B: Sample Question Prompts
+```
+Vraag: Wat zijn de vereisten voor het aangaan van een huwelijk?
+
+Scenario-uitbreiding: Een Nederlandse man wil trouwen met zijn nicht die in Marokko woont. Wat zijn de vereisten?
+```
+```
+Vraag: Hoe wordt bepaald welk recht van toepassing is op een internationale arbeidsovereenkomst?
+
+Scenario-uitbreiding: Een Nederlander gaat in België werken voor een Luxemburgs bedrijf. Welk arbeidsrecht is van toepassing?
+```
+
+These examples illustrate the paired format used in the evaluation dataset: one plain question followed by a scenario-enhanced variant targeting the same legal theme.
+
+## Appendix C: Operational Checklist
+- [ ] Secrets mounted under `./secrets` with correct permissions.
+- [ ] `.env` synced with the deployment environment.
+- [ ] Markdown corpus ingested into both OpenSearch and Weaviate.
+- [ ] API container logs show `gen.done` entries instead of fallbacks.
+- [ ] `evaluation` database contains the expected number of runs.
+- [ ] Results exported to JSON for archival or slide decks.
+
+## Acknowledgements
+Built on open legislation from wetten.overheid.nl and powered by the open-source communities behind FastAPI, Weaviate, and OpenSearch. Gemini models are accessed through Google Cloud Vertex AI; ensure you comply with their terms of service when running evaluations. Furthermore, Generative AI has been employed to debug, generate code. All code has been reviewed and we take full responsiblity for this project. 
