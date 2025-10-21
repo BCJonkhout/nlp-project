@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dutch Law RAG Evaluation</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    .option { border: 1px solid #ccc; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+    /* Hide sources; we only compare answers */
+    .row { display: flex; gap: 12px; }
+    .col { flex: 1; }
+    textarea { width: 100%; height: 80px; }
+    .muted { color: #777; font-size: 12px; }
+    button { padding: 8px 14px; }
+  </style>
+  <script>
+    async function startEval() {
+      const q = document.getElementById('question').value.trim();
+      if (!q) { alert('Please enter a question.'); return; }
+      const topK = parseInt(document.getElementById('topk').value || '5');
+      const windowSize = parseInt(document.getElementById('window').value || '0');
+      const res = await fetch('/evaluate/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q, top_k: topK, window_size: windowSize })
+      });
+      if (!res.ok) { alert('Failed to start evaluation'); return; }
+      const data = await res.json();
+      window.currentEval = data;
+      document.getElementById('evalId').textContent = data.evaluation_id;
+      document.getElementById('optA').textContent = data.optionA.answer;
+      document.getElementById('optB').textContent = data.optionB.answer;
+      // Do not render chunk sources in the UI
+    }
+    async function submitChoice(choice) {
+      if (!window.currentEval) { alert('Start an evaluation first.'); return; }
+      const res = await fetch('/evaluate/submit', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ evaluation_id: window.currentEval.evaluation_id, choice })
+      });
+      if (!res.ok) { alert('Submit failed'); return; }
+      const data = await res.json();
+      alert('Thanks! You picked ' + choice + ' (method: ' + data.chosen_method + ').');
+    }
+  </script>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Dutch Law RAG Evaluation</h1>
+      <p class="muted">Compare BM25 vs Embeddings retrieval with a constant generator.</p>
+
+      <div>
+        <label>Question</label>
+        <textarea id="question" placeholder="Stel een vraag over de Nederlandse wet..."></textarea>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Top K</label>
+          <input id="topk" type="number" value="5" min="1" max="20" />
+        </div>
+        <div class="col">
+          <label>Window size (neighbors)</label>
+          <input id="window" type="number" value="0" min="0" max="5" />
+        </div>
+      </div>
+      <p>
+        <button onclick="startEval()">Generate Options</button>
+        <span class="muted">Eval ID: <span id="evalId">-</span></span>
+      </p>
+
+      <div class="row">
+        <div class="col option">
+          <h3>Option A</h3>
+          <div id="optA">-</div>
+          <!-- sources hidden by design -->
+          <button onclick="submitChoice('A')">Pick A</button>
+        </div>
+        <div class="col option">
+          <h3>Option B</h3>
+          <div id="optB">-</div>
+          <!-- sources hidden by design -->
+          <button onclick="submitChoice('B')">Pick B</button>
+        </div>
+      </div>
+      <p>
+        <button onclick="submitChoice('N')">Geen voorkeur (neutraal)</button>
+      </p>
+    </div>
+  </body>
+  </html>
